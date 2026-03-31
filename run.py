@@ -434,21 +434,66 @@ class OracleBot:
             await asyncio.sleep(60.0)
 
     async def _settlement_loop(self):
-        """Check for settled markets and compute P&L."""
+        """
+        Settlement loop — runs every 30 seconds.
+        
+        3-step process:
+          1. resolve_outcomes() — detect which windows closed, determine UP/DOWN
+          2. check_settlements() — find trades with outcomes but no P&L yet
+          3. settle_trade() — compute won/lost/pnl for each
+        
+        Paper mode: uses Chainlink window data to determine outcome
+        Live mode: same + checks actual CLOB order fill status
+        """
+        # Wait 60s on startup for Chainlink windows to populate
+        await asyncio.sleep(60)
+        logger.info("Settlement loop started")
+
         while self._running:
             try:
-                settled = await self.db.check_settlements(self.mode)
-                for trade in settled:
+                # STEP 1: Detect which markets have resolved
+                clob_for_live = self.clob if self.mode == "live" else None
+                resolved = await self.db.resolve_outcomes(self.mode, clob_client=clob_for_live)
+                if resolved > 0:
+                    logger.info(f"Settlement: resolved {resolved} trade(s)")
+
+                # STEP 2: Find trades with outcomes, compute P&L
+                ready = await self.db.check_settlements(self.mode)
+                for trade in ready:
                     from engine.oracle_engine import compute_settlement, compute_pnl
                     result = compute_settlement(trade["side"], trade["outcome"])
                     pnl = compute_pnl(
                         result["won"], trade["fill_price"],
                         trade["size_usd"], self.engine.taker_fee_rate)
+
+                    # STEP 3: Write result
                     self.engine.record_pnl(pnl["net_pnl"])
                     await self.db.settle_trade(trade["id"], result, pnl, self.mode)
-                    logger.info(f"SETTLED: {result['reason']} | P&L=${pnl['net_pnl']:.2f}")
+
+                    # Log + Discord alert
+                    emoji = "✅" if result["won"] else "❌"
+                    logger.info(
+                        f"{emoji} SETTLED: {result['reason']} | "
+                        f"P&L=${pnl['net_pnl']:.2f} (gross=${pnl['gross_pnl']:.2f} fee=${pnl['fee']:.2f})"
+                    )
+
+                    # Discord webhook for settlement
+                    webhook = self.env.get("DISCORD_WEBHOOK_URL")
+                    if webhook:
+                        try:
+                            import httpx
+                            msg = (f"{emoji} **SETTLED** {trade['side']} → {trade['outcome']} "
+                                   f"| {'WON' if result['won'] else 'LOST'} "
+                                   f"| P&L: **${pnl['net_pnl']:.2f}** "
+                                   f"| Fill: ${trade['fill_price']:.3f} "
+                                   f"| Size: ${trade['size_usd']:.2f}")
+                            async with httpx.AsyncClient(timeout=5.0) as client:
+                                await client.post(webhook, json={"content": msg})
+                        except Exception:
+                            pass
+
             except Exception as e:
-                logger.debug(f"Settlement error: {e}")
+                logger.error(f"Settlement error: {e}", exc_info=True)
             await asyncio.sleep(30.0)
 
     # ── HELPERS ───────────────────────────────────────────
