@@ -108,33 +108,59 @@ class BookFetcher:
     """
     Fetch order book data from CLOB API.
     Returns simple dict with guaranteed keys.
+    
+    CRITICAL FIX: Polymarket CLOB API returns bids sorted ascending
+    (worst first) and asks sorted descending (worst first). Must use
+    max(bids) and min(asks) to get the actual best prices.
     """
 
-    @staticmethod
-    async def get_book(token_id: str) -> Dict:
+    def __init__(self):
+        self._client: Optional[httpx.AsyncClient] = None
+
+    async def _get_client(self) -> httpx.AsyncClient:
+        if self._client is None or self._client.is_closed:
+            self._client = httpx.AsyncClient(timeout=5.0)
+        return self._client
+
+    async def get_book(self, token_id: str) -> Dict:
         """
         Fetch order book for a token.
         Always returns dict with best_bid and best_ask keys.
         Values may be None if API fails.
         """
         try:
-            async with httpx.AsyncClient(timeout=5.0) as client:
-                resp = await client.get(f"{CLOB_API}/book", params={"token_id": token_id})
-                resp.raise_for_status()
-                data = resp.json()
+            client = await self._get_client()
+            resp = await client.get(f"{CLOB_API}/book", params={"token_id": token_id})
+            resp.raise_for_status()
+            data = resp.json()
 
-                bids = data.get("bids", [])
-                asks = data.get("asks", [])
+            if "error" in data:
+                logger.debug(f"Book API error: {data['error']}")
+                return {"best_bid": None, "best_ask": None, "bid_depth": 0, "ask_depth": 0}
 
-                best_bid = float(bids[0]["price"]) if bids else None
-                best_ask = float(asks[0]["price"]) if asks else None
+            bids = data.get("bids", [])
+            asks = data.get("asks", [])
 
-                return {
-                    "best_bid": best_bid,
-                    "best_ask": best_ask,
-                    "bid_depth": sum(float(b.get("size", 0)) for b in bids[:5]),
-                    "ask_depth": sum(float(a.get("size", 0)) for a in asks[:5]),
-                }
+            # CRITICAL: API returns bids ascending, asks descending
+            # Must use max/min to find actual best prices
+            best_bid = max((float(b["price"]) for b in bids), default=None) if bids else None
+            best_ask = min((float(a["price"]) for a in asks), default=None) if asks else None
+
+            # Sanity check: bid should be < ask
+            if best_bid and best_ask and best_bid >= best_ask:
+                logger.warning(f"Book crossed: bid=${best_bid} >= ask=${best_ask}")
+
+            bid_depth = sum(float(b.get("size", 0)) for b in bids
+                          if best_bid and abs(float(b["price"]) - best_bid) <= 0.05)
+            ask_depth = sum(float(a.get("size", 0)) for a in asks
+                          if best_ask and abs(float(a["price"]) - best_ask) <= 0.05)
+
+            return {
+                "best_bid": best_bid,
+                "best_ask": best_ask,
+                "bid_depth": round(bid_depth, 1),
+                "ask_depth": round(ask_depth, 1),
+            }
         except Exception as e:
             logger.debug(f"BookFetcher: {e}")
             return {"best_bid": None, "best_ask": None, "bid_depth": 0, "ask_depth": 0}
