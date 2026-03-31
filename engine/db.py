@@ -180,21 +180,137 @@ class DatabaseOps:
         except Exception as e:
             logger.error(f"Trade log failed: {e}")
 
+    async def resolve_outcomes(self, mode: str, clob_client=None) -> int:
+        """
+        STEP 1 of settlement: Detect which trades have resolved.
+        
+        For both paper and live:
+          - Find unsettled trades where the 5-min window has closed
+          - Look up Chainlink close price from chainlink_windows table
+          - Compare close vs open → UP or DOWN
+          - Write resolved_outcome to the trade row
+        
+        For live mode additionally:
+          - Check order fill status via CLOB API
+          - Update actual fill price if different from estimate
+        
+        Returns number of trades resolved.
+        """
+        table = "paper_settled" if mode == "paper" else "live_settled"
+        now_ts = int(time.time())
+        resolved_count = 0
+
+        try:
+            # Find unsettled trades where window has closed (window_ts + 300 < now)
+            resp = self._sb.table(table).select(
+                "id, window_ts, chainlink_open, side, order_id, fill_price, implied_direction"
+            ).is_("settled_at", "null").is_("resolved_outcome", "null").limit(50).execute()
+
+            for trade in (resp.data or []):
+                window_ts = trade.get("window_ts")
+                if not window_ts:
+                    continue
+
+                # Window must be fully closed (add 30s buffer for Chainlink to write)
+                window_end = window_ts + 300
+                if now_ts < window_end + 30:
+                    continue  # Window still open or just closed, wait
+
+                # Look up Chainlink close price from chainlink_windows table
+                cl_resp = self._sb.table("chainlink_windows").select(
+                    "close_price, open_price, price_move_pct, direction"
+                ).eq("window_ts", window_ts).limit(1).execute()
+
+                if not cl_resp.data:
+                    # Chainlink window not recorded yet — skip, will retry next cycle
+                    logger.debug(f"Settlement: No chainlink_windows row for {window_ts}")
+                    continue
+
+                cl_window = cl_resp.data[0]
+                close_price = cl_window.get("close_price")
+                open_price = cl_window.get("open_price") or trade.get("chainlink_open")
+
+                if not close_price or not open_price:
+                    continue
+
+                # Determine outcome: UP or DOWN
+                if close_price > open_price:
+                    outcome = "UP"
+                elif close_price < open_price:
+                    outcome = "DOWN"
+                else:
+                    # Exact tie — Polymarket typically resolves as DOWN (no change = not UP)
+                    outcome = "DOWN"
+
+                # For LIVE mode: verify order actually filled via CLOB API
+                actual_fill_price = trade.get("fill_price")
+                if mode == "live" and clob_client and trade.get("order_id"):
+                    try:
+                        order_status = clob_client.get_order(trade["order_id"])
+                        if order_status:
+                            status = order_status.get("status", "")
+                            if status in ("CANCELLED", "EXPIRED"):
+                                # Order never filled — mark as cancelled, not settled
+                                self._sb.table(table).update({
+                                    "resolved_outcome": outcome,
+                                    "won": None,
+                                    "net_pnl": 0,
+                                    "settled_at": datetime.now(timezone.utc).isoformat(),
+                                    "execution_mode": f"CANCELLED_{status}",
+                                }).eq("id", trade["id"]).execute()
+                                logger.warning(f"CANCELLED: Order {trade['order_id']} was {status}")
+                                resolved_count += 1
+                                continue
+
+                            # Update with actual fill price if available
+                            if order_status.get("price"):
+                                actual_fill_price = float(order_status["price"])
+                    except Exception as e:
+                        logger.debug(f"CLOB order check failed: {e}")
+
+                # Write resolved_outcome + chainlink_at_close
+                update_data = {
+                    "resolved_outcome": outcome,
+                    "chainlink_at_close": round(close_price, 2),
+                }
+                if actual_fill_price and actual_fill_price != trade.get("fill_price"):
+                    update_data["fill_price"] = round(actual_fill_price, 4)
+
+                self._sb.table(table).update(update_data).eq("id", trade["id"]).execute()
+                resolved_count += 1
+                logger.info(
+                    f"RESOLVED: window={window_ts} | open=${open_price:,.2f} "
+                    f"close=${close_price:,.2f} | outcome={outcome}"
+                )
+
+        except Exception as e:
+            logger.error(f"Resolution detection failed: {e}")
+
+        return resolved_count
+
     async def check_settlements(self, mode: str) -> List[Dict]:
+        """
+        STEP 2 of settlement: Find trades with resolved_outcome that need P&L computed.
+        Only returns trades where resolved_outcome is set but settled_at is still NULL.
+        """
         table = "paper_settled" if mode == "paper" else "live_settled"
         try:
             resp = self._sb.table(table).select(
                 "id, side, fill_price, size_usd, market_id, window_ts, resolved_outcome"
-            ).is_("settled_at", "null").limit(20).execute()
+            ).is_("settled_at", "null").not_.is_(
+                "resolved_outcome", "null"
+            ).limit(20).execute()
+
             return [{"id": r["id"], "side": r["side"], "outcome": r["resolved_outcome"],
                      "fill_price": float(r.get("fill_price", 0.50)),
                      "size_usd": float(r.get("size_usd", 0))}
-                    for r in (resp.data or []) if r.get("resolved_outcome")]
+                    for r in (resp.data or [])]
         except Exception as e:
             logger.debug(f"Settlement check failed: {e}")
             return []
 
     async def settle_trade(self, trade_id: str, result: Dict, pnl: Dict, mode: str):
+        """STEP 3: Write won/lost/pnl to the trade row."""
         table = "paper_settled" if mode == "paper" else "live_settled"
         try:
             self._sb.table(table).update({
