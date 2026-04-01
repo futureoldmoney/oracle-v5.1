@@ -474,6 +474,10 @@ class OracleBot:
                     self.engine.record_pnl(pnl["net_pnl"])
                     await self.db.settle_trade(trade["id"], result, pnl, self.mode)
 
+                    # Persist paper bankroll so it survives restarts
+                    if self.mode == "paper":
+                        await self.db.save_paper_bankroll(self.engine.bankroll)
+
                     # Log + Discord alert
                     emoji = "✅" if result["won"] else "❌"
                     logger.info(
@@ -486,11 +490,13 @@ class OracleBot:
                     if webhook:
                         try:
                             import httpx
+                            bal = self.engine.bankroll
                             msg = (f"{emoji} **SETTLED** {trade['side']} → {trade['outcome']} "
                                    f"| {'WON' if result['won'] else 'LOST'} "
                                    f"| P&L: **${pnl['net_pnl']:.2f}** "
                                    f"| Fill: ${trade['fill_price']:.3f} "
-                                   f"| Size: ${trade['size_usd']:.2f}")
+                                   f"| Size: ${trade['size_usd']:.2f} "
+                                   f"| Balance: ${bal:.2f}")
                             async with httpx.AsyncClient(timeout=5.0) as client:
                                 await client.post(webhook, json={"content": msg})
                         except Exception:
