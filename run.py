@@ -421,7 +421,7 @@ class OracleBot:
                     self.mode = new_mode
                     self.executor.mode = new_mode
 
-               # Sync wallet balance (live mode only)
+                # Sync wallet balance (live mode only — paper uses config bankroll)
                 if self.mode == "live":
                     balance = await self.db.sync_wallet_balance(self.clob)
                     if balance is not None:
