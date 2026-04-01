@@ -1,13 +1,12 @@
 """
-Discord Bot v5
-===============
-Simplified from v4's 1,141 lines to ~250 lines.
+Discord Bot v5.2
+=================
 Polls Discord channel for !commands, responds via webhook.
 
 Commands:
-  !status  — bot health, bankroll, last heartbeat
-  !trades  — recent trades
-  !pnl     — profit/loss summary
+  !status  — bot health, bankroll, running P&L
+  !trades  — recent trades with outcomes
+  !pnl     — full P&L summary with running balance
   !mode    — switch paper/live
   !config  — show current config
   !set     — update config value
@@ -48,34 +47,28 @@ class DiscordBot:
         headers = {"Authorization": f"Bot {self._token}"}
 
         async with httpx.AsyncClient(headers=headers, timeout=10.0) as client:
-            # Get latest message ID to avoid processing old messages
-            try:
-                resp = await client.get(
-                    f"https://discord.com/api/v10/channels/{self._channel_id}/messages",
-                    params={"limit": 1})
-                if resp.status_code == 200 and resp.json():
-                    self._last_message_id = resp.json()[0]["id"]
-            except Exception:
-                pass
-
             while True:
                 try:
-                    params = {"limit": 10}
+                    url = f"https://discord.com/api/v10/channels/{self._channel_id}/messages"
+                    params = {"limit": 5}
                     if self._last_message_id:
                         params["after"] = self._last_message_id
 
-                    resp = await client.get(
-                        f"https://discord.com/api/v10/channels/{self._channel_id}/messages",
-                        params=params)
-
+                    resp = await client.get(url, params=params)
                     if resp.status_code == 200:
                         messages = resp.json()
-                        for msg in sorted(messages, key=lambda m: m["id"]):
+                        # Process oldest first
+                        for msg in reversed(messages):
                             self._last_message_id = msg["id"]
                             content = msg.get("content", "").strip()
+                            # Ignore bot messages and non-commands
+                            if msg.get("author", {}).get("bot"):
+                                continue
                             if content.startswith("!"):
                                 await self._handle_command(content)
-
+                    elif resp.status_code == 429:
+                        retry = resp.json().get("retry_after", 5)
+                        await asyncio.sleep(retry)
                 except Exception as e:
                     logger.debug(f"Discord poll error: {e}")
 
@@ -108,29 +101,42 @@ class DiscordBot:
             await self._reply(f"Error: {e}")
 
     async def _cmd_status(self):
-        """Show bot health."""
+        """Show bot health with running P&L."""
         try:
+            # Get latest heartbeat
             hb = self.sb.table("heartbeats_v2").select(
                 "*").order("created_at", desc=True).limit(1).execute()
+
+            # Get P&L summary
+            mode = await self._get_mode()
+            pnl = await self.db.get_pnl_summary(mode)
+
             if hb.data:
                 h = hb.data[0]
                 age = "?"
                 if h.get("created_at"):
                     created = datetime.fromisoformat(h["created_at"].replace("Z", "+00:00"))
                     age = f"{int((datetime.now(timezone.utc) - created).total_seconds())}s ago"
+
+                # Show running balance
+                balance = pnl["current_balance"]
+                total_pnl = pnl["total_pnl"]
+                pnl_emoji = "📈" if total_pnl >= 0 else "📉"
+                pnl_sign = "+" if total_pnl >= 0 else ""
+
                 await self._reply(
                     f"**Oracle Bot v5**\n"
                     f"Mode: `{h.get('bot_mode', '?')}`\n"
-                    f"Balance: `${h.get('balance_usdc', 0):.2f}`\n"
-                    f"Status: `{h.get('status', '?')}`\n"
-                    f"Last heartbeat: `{age}`")
+                    f"Balance: `${balance:.2f}` {pnl_emoji} `{pnl_sign}${total_pnl:.2f}`\n"
+                    f"Trades: `{pnl['total_trades']}` | W/L: `{pnl['wins']}/{pnl['losses']}` | WR: `{pnl['win_rate']}%`\n"
+                    f"Status: `{h.get('status', '?')}` | Heartbeat: `{age}`")
             else:
                 await self._reply("No heartbeat data found")
         except Exception as e:
             await self._reply(f"Status failed: {e}")
 
     async def _cmd_trades(self):
-        """Show recent trades."""
+        """Show recent trades with v5 columns."""
         mode = await self._get_mode()
         trades = await self.db.get_recent_trades(mode, limit=5)
         if not trades:
@@ -139,24 +145,46 @@ class DiscordBot:
 
         lines = ["**Recent Trades:**"]
         for t in trades:
-            won = "✅" if t.get("won") else "❌" if t.get("won") is False else "⏳"
+            won = t.get("won")
+            if won is True:
+                emoji = "✅"
+            elif won is False:
+                emoji = "❌"
+            else:
+                emoji = "⏳"
+
+            side = t.get("side", "?")
+            direction = t.get("implied_direction", "?")
+            fill = float(t.get("fill_price") or t.get("hypothetical_price") or 0)
+            size = float(t.get("size_usd") or t.get("hypothetical_size_usdc") or 0)
+            pnl = float(t.get("net_pnl") or t.get("pnl_usdc") or 0)
+            edge = float(t.get("edge_pct") or 0)
+
+            pnl_str = f"${pnl:+.2f}" if won is not None else "pending"
+
             lines.append(
-                f"{won} {t.get('side', '?')} {t.get('implied_direction', '?')} | "
-                f"${t.get('hypothetical_size_usdc', 0):.2f} @ "
-                f"${t.get('hypothetical_price', 0):.3f} | "
-                f"P&L: ${t.get('pnl_usdc', 0):.2f}")
+                f"{emoji} {side} {direction} | "
+                f"fill=${fill:.3f} edge={edge:.1f}% | "
+                f"${size:.2f} → **{pnl_str}**")
+
         await self._reply("\n".join(lines))
 
     async def _cmd_pnl(self):
-        """Show P&L summary."""
+        """Show full P&L summary with running balance."""
         mode = await self._get_mode()
         pnl = await self.db.get_pnl_summary(mode)
+
+        total = pnl["total_pnl"]
+        pnl_sign = "+" if total >= 0 else ""
+        pnl_emoji = "📈" if total >= 0 else "📉"
+
         await self._reply(
-            f"**P&L Summary ({mode})**\n"
+            f"**P&L Summary ({mode})** {pnl_emoji}\n"
+            f"Starting: `${pnl['starting_bankroll']:.2f}`\n"
+            f"Current:  `${pnl['current_balance']:.2f}` (`{pnl_sign}${total:.2f}`)\n"
             f"Trades: `{pnl['total_trades']}` | "
             f"W/L: `{pnl['wins']}/{pnl['losses']}` | "
-            f"Win rate: `{pnl['win_rate']}%`\n"
-            f"Total P&L: `${pnl['total_pnl']:.2f}`")
+            f"Win rate: `{pnl['win_rate']}%`")
 
     async def _cmd_mode(self, args):
         """Switch mode."""
@@ -213,9 +241,9 @@ class DiscordBot:
     async def _cmd_help(self):
         await self._reply(
             "**Oracle Bot v5 Commands:**\n"
-            "`!status` — bot health\n"
+            "`!status` — health + running P&L\n"
             "`!trades` — recent trades\n"
-            "`!pnl` — profit/loss\n"
+            "`!pnl` — full P&L breakdown\n"
             "`!mode [paper|live]` — switch mode\n"
             "`!config` — show config\n"
             "`!set <key> <value>` — update config")
