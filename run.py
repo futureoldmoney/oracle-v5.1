@@ -421,10 +421,11 @@ class OracleBot:
                     self.mode = new_mode
                     self.executor.mode = new_mode
 
-                # Sync wallet balance
-                balance = await self.db.sync_wallet_balance(self.clob)
-                if balance is not None:
-                    self.engine.update_bankroll(balance)
+               # Sync wallet balance (live mode only)
+                if self.mode == "live":
+                    balance = await self.db.sync_wallet_balance(self.clob)
+                    if balance is not None:
+                        self.engine.update_bankroll(balance)
 
                 # Write heartbeat
                 await self.db.write_heartbeat(
