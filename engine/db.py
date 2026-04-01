@@ -1,9 +1,12 @@
 """
-Database Operations v5.1
+Database Operations v5.2
 =========================
-Updated for heartbeat observability schema.
+Updated for running P&L tracking.
 
-eval_heartbeat: EVERY evaluation cycle (~3s) — what the bot sees and thinks
+Key change: Paper bankroll updates after each settlement so it tracks
+cumulative performance and survives restarts. Live mode uses real wallet.
+
+eval_heartbeat: EVERY evaluation cycle (~3s)
 paper_settled / live_settled: ONLY executed trades with outcomes
 """
 
@@ -43,6 +46,8 @@ class DatabaseOps:
     def __init__(self, supabase_client):
         self._sb = supabase_client
 
+    # ── CONFIG ────────────────────────────────────────────
+
     async def load_config(self) -> Optional[Dict]:
         try:
             resp = self._sb.table("bot_config").select("*").eq("id", 1).limit(1).execute()
@@ -61,6 +66,8 @@ class DatabaseOps:
             logger.error(f"Config update failed: {e}")
             return False
 
+    # ── MODE CONTROL ──────────────────────────────────────
+
     async def set_mode(self, mode: str) -> bool:
         try:
             self._sb.table("bot_control").upsert(
@@ -73,6 +80,8 @@ class DatabaseOps:
             logger.error(f"Mode set failed: {e}")
             return False
 
+    # ── HEARTBEAT (system health) ─────────────────────────
+
     async def write_heartbeat(self, mode: str, balance: float, cycle_count: int):
         try:
             self._sb.table("heartbeats_v2").insert({
@@ -82,6 +91,8 @@ class DatabaseOps:
             }).execute()
         except Exception as e:
             logger.debug(f"Heartbeat write failed: {e}")
+
+    # ── EVAL HEARTBEAT (every ~3s evaluation) ─────────────
 
     async def log_eval_heartbeat(self, decision, market: Dict, market_data: Dict,
                                   cycle_number: int, eval_duration_ms: float,
@@ -133,7 +144,7 @@ class DatabaseOps:
                 "execution_mode": decision.execution_mode if decision.should_trade else None,
                 "cycle_number": cycle_number,
                 "eval_duration_ms": round(eval_duration_ms, 2),
-                "engine_version": "5.1.0",
+                "engine_version": "5.2.0",
                 "bot_mode": mode,
             }
             resp = self._sb.table("eval_heartbeat").insert(row).execute()
@@ -143,6 +154,8 @@ class DatabaseOps:
         except Exception as e:
             logger.error(f"Eval heartbeat write failed: {e}")
             return None
+
+    # ── TRADE EXECUTION LOG ───────────────────────────────
 
     async def log_trade(self, decision, market: Dict, result, heartbeat_id: Optional[str], mode: str):
         table = "paper_settled" if mode == "paper" else "live_settled"
@@ -173,35 +186,22 @@ class DatabaseOps:
                 "coinbase_price": round(decision.coinbase_price, 2) if decision.coinbase_price else None,
                 "tick_velocity": round(decision.tick_velocity, 6) if decision.tick_velocity else None,
                 "bankroll_at_trade": round(decision.size_usd / decision.size_pct, 2) if decision.size_pct > 0 else None,
-                "engine_version": "5.1.0",
+                "engine_version": "5.2.0",
                 "bot_mode": mode,
             }
             self._sb.table(table).insert(row).execute()
         except Exception as e:
             logger.error(f"Trade log failed: {e}")
 
+    # ── SETTLEMENT (3-step pipeline) ──────────────────────
+
     async def resolve_outcomes(self, mode: str, clob_client=None) -> int:
-        """
-        STEP 1 of settlement: Detect which trades have resolved.
-        
-        For both paper and live:
-          - Find unsettled trades where the 5-min window has closed
-          - Look up Chainlink close price from chainlink_windows table
-          - Compare close vs open → UP or DOWN
-          - Write resolved_outcome to the trade row
-        
-        For live mode additionally:
-          - Check order fill status via CLOB API
-          - Update actual fill price if different from estimate
-        
-        Returns number of trades resolved.
-        """
+        """STEP 1: Detect which trades have resolved by checking Chainlink close prices."""
         table = "paper_settled" if mode == "paper" else "live_settled"
         now_ts = int(time.time())
         resolved_count = 0
 
         try:
-            # Find unsettled trades where window has closed (window_ts + 300 < now)
             resp = self._sb.table(table).select(
                 "id, window_ts, chainlink_open, side, order_id, fill_price, implied_direction"
             ).is_("settled_at", "null").is_("resolved_outcome", "null").limit(50).execute()
@@ -211,18 +211,15 @@ class DatabaseOps:
                 if not window_ts:
                     continue
 
-                # Window must be fully closed (add 30s buffer for Chainlink to write)
                 window_end = window_ts + 300
                 if now_ts < window_end + 30:
-                    continue  # Window still open or just closed, wait
+                    continue
 
-                # Look up Chainlink close price from chainlink_windows table
                 cl_resp = self._sb.table("chainlink_windows").select(
                     "close_price, open_price, price_move_pct, direction"
                 ).eq("window_ts", window_ts).limit(1).execute()
 
                 if not cl_resp.data:
-                    # Chainlink window not recorded yet — skip, will retry next cycle
                     logger.debug(f"Settlement: No chainlink_windows row for {window_ts}")
                     continue
 
@@ -233,16 +230,13 @@ class DatabaseOps:
                 if not close_price or not open_price:
                     continue
 
-                # Determine outcome: UP or DOWN
                 if close_price > open_price:
                     outcome = "UP"
                 elif close_price < open_price:
                     outcome = "DOWN"
                 else:
-                    # Exact tie — Polymarket typically resolves as DOWN (no change = not UP)
                     outcome = "DOWN"
 
-                # For LIVE mode: verify order actually filled via CLOB API
                 actual_fill_price = trade.get("fill_price")
                 if mode == "live" and clob_client and trade.get("order_id"):
                     try:
@@ -250,25 +244,19 @@ class DatabaseOps:
                         if order_status:
                             status = order_status.get("status", "")
                             if status in ("CANCELLED", "EXPIRED"):
-                                # Order never filled — mark as cancelled, not settled
                                 self._sb.table(table).update({
                                     "resolved_outcome": outcome,
-                                    "won": None,
-                                    "net_pnl": 0,
+                                    "won": None, "net_pnl": 0,
                                     "settled_at": datetime.now(timezone.utc).isoformat(),
                                     "execution_mode": f"CANCELLED_{status}",
                                 }).eq("id", trade["id"]).execute()
-                                logger.warning(f"CANCELLED: Order {trade['order_id']} was {status}")
                                 resolved_count += 1
                                 continue
-
-                            # Update with actual fill price if available
                             if order_status.get("price"):
                                 actual_fill_price = float(order_status["price"])
                     except Exception as e:
                         logger.debug(f"CLOB order check failed: {e}")
 
-                # Write resolved_outcome + chainlink_at_close
                 update_data = {
                     "resolved_outcome": outcome,
                     "chainlink_at_close": round(close_price, 2),
@@ -278,10 +266,7 @@ class DatabaseOps:
 
                 self._sb.table(table).update(update_data).eq("id", trade["id"]).execute()
                 resolved_count += 1
-                logger.info(
-                    f"RESOLVED: window={window_ts} | open=${open_price:,.2f} "
-                    f"close=${close_price:,.2f} | outcome={outcome}"
-                )
+                logger.info(f"RESOLVED: window={window_ts} | open=${open_price:,.2f} close=${close_price:,.2f} | outcome={outcome}")
 
         except Exception as e:
             logger.error(f"Resolution detection failed: {e}")
@@ -289,10 +274,7 @@ class DatabaseOps:
         return resolved_count
 
     async def check_settlements(self, mode: str) -> List[Dict]:
-        """
-        STEP 2 of settlement: Find trades with resolved_outcome that need P&L computed.
-        Only returns trades where resolved_outcome is set but settled_at is still NULL.
-        """
+        """STEP 2: Find trades with resolved_outcome but no P&L yet."""
         table = "paper_settled" if mode == "paper" else "live_settled"
         try:
             resp = self._sb.table(table).select(
@@ -302,8 +284,8 @@ class DatabaseOps:
             ).limit(20).execute()
 
             return [{"id": r["id"], "side": r["side"], "outcome": r["resolved_outcome"],
-                     "fill_price": float(r.get("fill_price", 0.50)),
-                     "size_usd": float(r.get("size_usd", 0))}
+                     "fill_price": float(r.get("fill_price") or 0.50),
+                     "size_usd": float(r.get("size_usd") or 0)}
                     for r in (resp.data or [])]
         except Exception as e:
             logger.debug(f"Settlement check failed: {e}")
@@ -321,6 +303,19 @@ class DatabaseOps:
             }).eq("id", trade_id).execute()
         except Exception as e:
             logger.error(f"Settlement write failed: {e}")
+
+    async def save_paper_bankroll(self, new_bankroll: float):
+        """Persist paper bankroll to bot_config so it survives restarts."""
+        try:
+            self._sb.table("bot_config").update({
+                "bankroll": round(new_bankroll, 2),
+                "updated_at": datetime.now(timezone.utc).isoformat(),
+                "updated_by": "SETTLEMENT",
+            }).eq("id", 1).execute()
+        except Exception as e:
+            logger.error(f"Bankroll save failed: {e}")
+
+    # ── WALLET BALANCE ────────────────────────────────────
 
     async def sync_wallet_balance(self, clob_client) -> Optional[float]:
         try:
@@ -341,6 +336,8 @@ class DatabaseOps:
             logger.debug(f"Balance sync failed: {e}")
         return None
 
+    # ── STATUS QUERIES ────────────────────────────────────
+
     async def get_recent_trades(self, mode: str, limit: int = 10) -> List[Dict]:
         table = "paper_settled" if mode == "paper" else "live_settled"
         try:
@@ -350,15 +347,71 @@ class DatabaseOps:
             return []
 
     async def get_pnl_summary(self, mode: str) -> Dict:
+        """
+        Get complete P&L summary with running balance.
+        Handles None values safely. Works for both paper and live.
+        """
         table = "paper_settled" if mode == "paper" else "live_settled"
         try:
-            resp = self._sb.table(table).select("won, net_pnl").not_.is_("won", "null").execute()
+            # Get all settled trades (v5 uses net_pnl, v4 used pnl_usdc)
+            resp = self._sb.table(table).select(
+                "won, net_pnl, pnl_usdc, settled_at"
+            ).not_.is_("settled_at", "null").execute()
+
             trades = resp.data or []
             if not trades:
-                return {"total_trades": 0, "wins": 0, "losses": 0, "total_pnl": 0, "win_rate": 0}
-            wins = sum(1 for t in trades if t.get("won"))
-            total_pnl = sum(float(t.get("net_pnl", 0)) for t in trades)
-            return {"total_trades": len(trades), "wins": wins, "losses": len(trades) - wins,
-                    "total_pnl": round(total_pnl, 2), "win_rate": round(wins / len(trades) * 100, 1)}
-        except Exception:
-            return {"total_trades": 0, "wins": 0, "losses": 0, "total_pnl": 0, "win_rate": 0}
+                # Get starting bankroll from config
+                config = await self.load_config()
+                starting = float(config.get("bankroll", 500)) if config else 500
+                return {
+                    "total_trades": 0, "wins": 0, "losses": 0,
+                    "total_pnl": 0, "win_rate": 0,
+                    "starting_bankroll": starting,
+                    "current_balance": starting,
+                }
+
+            wins = 0
+            losses = 0
+            total_pnl = 0.0
+
+            for t in trades:
+                # Determine win/loss
+                won = t.get("won")
+                if won is True:
+                    wins += 1
+                elif won is False:
+                    losses += 1
+
+                # Get P&L (try net_pnl first, fall back to pnl_usdc)
+                pnl_val = t.get("net_pnl")
+                if pnl_val is None:
+                    pnl_val = t.get("pnl_usdc")
+                if pnl_val is not None:
+                    try:
+                        total_pnl += float(pnl_val)
+                    except (TypeError, ValueError):
+                        pass
+
+            total_trades = wins + losses
+            win_rate = round(wins / total_trades * 100, 1) if total_trades > 0 else 0
+
+            # Get current bankroll from config (it gets updated after each settlement)
+            config = await self.load_config()
+            current_balance = float(config.get("bankroll", 500)) if config else 500
+
+            return {
+                "total_trades": total_trades,
+                "wins": wins,
+                "losses": losses,
+                "total_pnl": round(total_pnl, 2),
+                "win_rate": win_rate,
+                "starting_bankroll": round(current_balance - total_pnl, 2),
+                "current_balance": round(current_balance, 2),
+            }
+        except Exception as e:
+            logger.error(f"PnL summary failed: {e}")
+            return {
+                "total_trades": 0, "wins": 0, "losses": 0,
+                "total_pnl": 0, "win_rate": 0,
+                "starting_bankroll": 500, "current_balance": 500,
+            }
