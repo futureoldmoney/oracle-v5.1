@@ -196,11 +196,14 @@ class OracleBot:
         self.executor = OrderExecutor(self.clob, mode=self.mode)
         logger.info(f"✓ Executor initialized (mode={self.mode})")
 
-        # 10. Wallet balance
-        balance = await self.db.sync_wallet_balance(self.clob)
-        if balance is not None:
-            self.engine.update_bankroll(balance)
-            logger.info(f"✓ Wallet balance: ${balance:.2f}")
+        # 10. Wallet balance (live mode only — paper uses config bankroll)
+        if self.mode == "live":
+            balance = await self.db.sync_wallet_balance(self.clob)
+            if balance is not None:
+                self.engine.update_bankroll(balance)
+                logger.info(f"✓ Wallet balance: ${balance:.2f}")
+        else:
+            logger.info(f"✓ Paper bankroll: ${self.engine.bankroll:.2f} (from config)")
 
         logger.info("=" * 60)
         logger.info(f"Oracle Bot v5 ready ({self.mode} mode)")
